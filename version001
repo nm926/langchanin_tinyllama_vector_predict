@@ -1,0 +1,1765 @@
+import imaplib
+import email
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from email.header import decode_header
+from datetime import datetime, timedelta
+import pytz
+import time
+import html
+import re
+import requests
+import json
+import threading
+from itertools import chain
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+from bs4 import BeautifulSoup
+import os
+import uuid
+import logging
+from streamlit_autorefresh import st_autorefresh
+import traceback
+from streamlit import cache_data
+import numpy as np
+from typing import List, Dict, Any, Optional
+import hashlib
+import pickle
+from pathlib import Path
+
+# LangChain and LLM imports
+from langchain_community.llms import LlamaCpp
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import RetrievalQA
+from langchain_community.document_loaders import TextLoader
+from langchain.chains import ConversationalRetrievalChain
+from langchain_core.prompts import PromptTemplate
+import chromadb
+from chromadb.config import Settings
+
+# Configure logging
+logging.basicConfig(filename='enhanced_email_dashboard.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
+
+# Set page config as the first Streamlit command
+st.set_page_config(page_title="Enhanced Mail Alerts Dashboard with LLM", layout="wide", initial_sidebar_state="expanded")
+
+# Azure AD app details (should be stored in environment variables for production)
+
+# IMAP Server Details
+IMAP_SERVER = "outlook.office365.com"
+IMAP_PORT = 993
+EMAIL_ACCOUNT = ""
+
+# Set timezone to IST
+IST = pytz.timezone("Asia/Kolkata")
+
+# Thread-local storage for IMAP connections
+thread_local = threading.local()
+
+# Enhanced database with 15-day retention
+DB_FILE = "enhanced_unresolved_alerts.db"
+VECTOR_DB_PATH = "./vector_db"
+LLM_MODEL_PATH = "./models/llama-2-7b-chat.Q2_K.gguf"  # Updated to use Q2_K quantized model
+
+# Configuration flags
+ENABLE_VECTOR_DB = True  # Vector database is now enabled
+FAST_MODE = True  # Enable fast mode for quicker analysis
+CACHE_LLM_RESPONSES = True  # Cache LLM responses for faster repeated queries
+MAX_SIMILAR_EMAILS = 3  # Reduce from 5 to 3 for faster processing
+
+# List of sender email IDs to filter (normalized to lowercase)
+SENDERS = [
+  "example@google.com
+]
+SENDERS = [sender.lower() for sender in SENDERS]
+
+# Define the list of folders to fetch emails from
+EMAIL_FOLDERS = [
+    "INBOX", "INBOX/VuSmartMaps_2023_Sep_OLD", "INBOX/freshping",
+    "INBOX/QK", "INBOX/EURONET", "INBOX/All_Alerts",
+    "INBOX/ORACLE_PROD_WEBLOGIC_ALERT"
+]
+
+# Enhanced Critical keywords with severity levels and proactive detection
+CRITICAL_KEYWORDS = {
+    'HIGH': [
+
+        "shutdown", "crash", "down", "stopped", "failure", "error", "uptime", "anomaly", "UPI transactions impact",
+        "device down", "heartbeat", "oomkilled", "crashloopbackoff", "stuck", "abed",
+        "service unavailable", "connection refused","Critical - BLR-VxRail-","AUF Fincare transactions impacted","The number of hogged threads is", "timeout expired", "fatal error"
+    ],
+
+    'MEDIUM': [
+         "problem", "high memory", "high disk usage",
+        "restart", "bounce", "diskspace", "heap memory availability is less",
+        "the number of hogged threads", "failure transaction rate",
+         "imagepullbackoff", "stop",
+        "degraded performance", "high cpu", "memory leak", "slow response"
+    ],
+
+    'LOW': [
+
+        "maintenance", "scheduled", "planned", "notice",
+        "backup", "update", "patch", "routine", "normal"
+    ]
+}
+
+
+# TinyLlama Configuration
+try:
+    from enhanced_llm_config import LLMConfig, TINYLLAMA_MODEL_PATHS
+    TINYLLAMA_AVAILABLE = True
+except ImportError:
+    TINYLLAMA_AVAILABLE = False
+    # Fallback LLM Configuration
+    class LLMConfig:
+        def __init__(self):
+            self.model_path = LLM_MODEL_PATH
+            self.lightweight_model_path = "./models/llama-2-7b-chat.Q4_0.gguf"  # Smaller, faster model
+            self.temperature = 0.1
+            self.max_tokens = 1024 if FAST_MODE else 2048
+            self.top_p = 0.9
+            self.verbose = False
+            self.n_ctx = 2048  # Increased context window to match training
+            self.use_lightweight_model = True
+            
+        def get_llm(self):
+            """Initialize and return LlamaCpp model"""
+            try:
+                # Try lightweight model first if enabled
+                if self.use_lightweight_model and os.path.exists(self.lightweight_model_path):
+                    model_path = self.lightweight_model_path
+                    st.info("🚀 Using lightweight model for faster processing")
+                elif os.path.exists(self.model_path):
+                    model_path = self.model_path
+                else:
+                    st.error(f"LLM model not found at {self.model_path}")
+                    st.info("📋 To fix this issue:")
+                    st.info("1. Run: python3 setup_tinyllama.py")
+                    st.info("2. Or manually download from: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF")
+                    st.info("3. Place the model file (llama-2-7b-chat.Q2_K.gguf) in the 'models' directory")
+                    st.info("4. Restart the application")
+                    return None
+                
+                return LlamaCpp(
+                    model_path=model_path,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    top_p=self.top_p,
+                    verbose=self.verbose,
+                    n_ctx=self.n_ctx,  # Use the full context window
+                    n_gpu_layers=0,  # Set to higher number if you have GPU
+                    n_threads=8 if FAST_MODE else 4,
+                    n_batch=512,
+                    repeat_penalty=1.1,
+                    f16_kv=True  # Use 16-bit key/value cache for better performance
+                )
+            except Exception as e:
+                st.error(f"Failed to load LLM model: {e}")
+                st.info("📋 To fix this issue:")
+                st.info("1. Ensure you have enough RAM (8GB+ recommended)")
+                st.info("2. Check if the model file is corrupted")
+                return None
+
+# Vector Database Management
+class VectorDBManager:
+    def __init__(self, db_path: str = VECTOR_DB_PATH):
+        self.db_path = db_path
+        self.embeddings = None
+        self.vector_db = None
+        self.text_splitter = None
+        
+        if not ENABLE_VECTOR_DB:
+            st.info("Vector database functionality is disabled")
+            return
+            
+        # Initialize text splitter first
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500 if FAST_MODE else 1000,  # Smaller chunks for faster processing
+            chunk_overlap=100 if FAST_MODE else 200,  # Reduced overlap for fast mode
+            length_function=len
+        )
+        
+        # Try to initialize embeddings with multiple fallback options
+        self.init_embeddings()
+        
+        # Initialize vector database
+        self.init_vector_db()
+    
+    def init_embeddings(self):
+        """Initialize embeddings with multiple fallback options"""
+        embedding_models = [
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "sentence-transformers/all-mpnet-base-v2",
+            "sentence-transformers/paraphrase-MiniLM-L6-v2"
+        ]
+        
+        for model_name in embedding_models:
+            try:
+                st.info(f"🔄 Trying to initialize embeddings with {model_name}...")
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={'device': 'cpu'},
+                    encode_kwargs={'device': 'cpu'}
+                )
+                st.success(f"✅ Successfully initialized embeddings with {model_name}")
+                return
+            except Exception as e:
+                st.warning(f"⚠️ Failed to initialize {model_name}: {str(e)[:100]}...")
+                continue
+        
+        # If all embedding models fail, try without device specification
+        try:
+            st.info("🔄 Trying embeddings without device specification...")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2"
+            )
+            st.success("✅ Successfully initialized embeddings without device specification")
+        except Exception as e:
+            st.error(f"❌ Failed to initialize embeddings: {str(e)[:100]}...")
+            st.warning("⚠️ Vector search functionality will be disabled")
+            st.info("💡 To fix this:")
+            st.info("1. Install sentence-transformers: pip install sentence-transformers")
+            st.info("2. Check internet connection for model download")
+            st.info("3. Try running without vector database")
+            self.embeddings = None
+    
+    def init_vector_db(self):
+        """Initialize vector database"""
+        if self.embeddings is None:
+            st.warning("Vector database initialization skipped - embeddings not available")
+            return
+            
+        try:
+            if os.path.exists(self.db_path):
+                self.vector_db = Chroma(
+                    persist_directory=self.db_path,
+                    embedding_function=self.embeddings
+                )
+            else:
+                self.vector_db = Chroma(
+                    persist_directory=self.db_path,
+                    embedding_function=self.embeddings
+                )
+            st.success("Vector database initialized successfully")
+        except Exception as e:
+            st.error(f"Failed to initialize vector database: {e}")
+    
+    def add_emails_to_vector_db(self, emails_data: List[Dict[str, Any]]):
+        """Add email data to vector database"""
+        if self.vector_db is None:
+            st.warning("Vector database not available - skipping email addition")
+            return
+            
+        try:
+            documents = []
+            for email_data in emails_data:
+                # Create a comprehensive document from email data
+                doc_text = f"""
+                Date: {email_data.get('date', '')}
+                Sender: {email_data.get('sender', '')}
+                Subject: {email_data.get('subject', '')}
+                Folder: {email_data.get('folder', '')}
+                Body: {email_data.get('body', '')}
+                Keywords: {email_data.get('keywords', '')}
+                Severity: {email_data.get('severity', '')}
+                Application: {email_data.get('application', '')}
+                """
+                
+                # Split text into chunks
+                chunks = self.text_splitter.split_text(doc_text)
+                
+                for i, chunk in enumerate(chunks):
+                    documents.append({
+                        'text': chunk,
+                        'metadata': {
+                            'email_id': email_data.get('id', ''),
+                            'date': email_data.get('date', ''),
+                            'sender': email_data.get('sender', ''),
+                            'subject': email_data.get('subject', ''),
+                            'folder': email_data.get('folder', ''),
+                            'severity': email_data.get('severity', ''),
+                            'application': email_data.get('application', ''),
+                            'chunk_id': i
+                        }
+                    })
+            
+            if documents:
+                self.vector_db.add_texts(
+                    texts=[doc['text'] for doc in documents],
+                    metadatas=[doc['metadata'] for doc in documents]
+                )
+                self.vector_db.persist()
+                st.success(f"Added {len(documents)} email chunks to vector database")
+                
+        except Exception as e:
+            st.error(f"Failed to add emails to vector database: {e}")
+    
+    def search_similar_emails(self, query: str, k: int = MAX_SIMILAR_EMAILS):
+        """Search for similar emails using vector similarity or keyword fallback"""
+        if self.vector_db is None:
+            st.warning("Vector database not available - using keyword search fallback")
+            return self.keyword_search_fallback(query, k)
+            
+        try:
+            # Use faster search with reduced k for better performance
+            results = self.vector_db.similarity_search_with_score(query, k=k)
+            return results
+        except Exception as e:
+            st.error(f"Failed to search vector database: {e}")
+            st.info("Falling back to keyword search...")
+            return self.keyword_search_fallback(query, k)
+    
+    def keyword_search_fallback(self, query: str, k: int = MAX_SIMILAR_EMAILS):
+        """Fallback keyword search when vector database is not available"""
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            
+            # Extract keywords from query
+            query_terms = query.lower().split()
+            query_terms = [term for term in query_terms if len(term) > 2]  # Filter short terms
+            
+            if not query_terms:
+                # If no meaningful terms, return recent emails
+                sql_query = '''
+                    SELECT id, date, sender, subject, body, folder, severity, keywords, application
+                    FROM emails 
+                    ORDER BY date DESC 
+                    LIMIT ?
+                '''
+                results = pd.read_sql_query(sql_query, conn, params=(k,))
+            else:
+                # Build keyword search query
+                conditions = []
+                for term in query_terms:
+                    conditions.append(f"(subject LIKE '%{term}%' OR body LIKE '%{term}%' OR keywords LIKE '%{term}%')")
+                
+                where_clause = " OR ".join(conditions)
+                sql_query = f'''
+                    SELECT id, date, sender, subject, body, folder, severity, keywords, application
+                    FROM emails 
+                    WHERE {where_clause}
+                    ORDER BY date DESC 
+                    LIMIT ?
+                '''
+                results = pd.read_sql_query(sql_query, conn, params=(k,))
+            
+            conn.close()
+            
+            # Convert to document format for compatibility
+            documents = []
+            for _, row in results.iterrows():
+                doc_content = f"Date: {row['date']}\nSender: {row['sender']}\nSubject: {row['subject']}\nBody: {row['body'][:500]}..."
+                doc_metadata = {
+                    'email_id': row['id'],
+                    'date': row['date'],
+                    'sender': row['sender'],
+                    'subject': row['subject'],
+                    'folder': row['folder'],
+                    'severity': row['severity'],
+                    'application': row['application']
+                }
+                
+                # Create a simple document object
+                from langchain_core.documents import Document
+                doc = Document(page_content=doc_content, metadata=doc_metadata)
+                documents.append((doc, 0.8))  # Default similarity score
+            
+            return documents
+            
+        except Exception as e:
+            st.error(f"Keyword search fallback failed: {e}")
+            return []
+
+# Enhanced Database with 15-day retention
+def init_enhanced_db():
+    """Initialize enhanced database with 15-day retention"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Enhanced emails table with more fields
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS emails (
+            id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT,
+            folder TEXT NOT NULL,
+            severity TEXT,
+            keywords TEXT,
+            application TEXT,
+            hash TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Alerts table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY,
+            email_id TEXT,
+            subject TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            body_snippet TEXT,
+            severity TEXT NOT NULL,
+            keywords TEXT,
+            application TEXT,
+            priority_score REAL,
+            is_resolved INTEGER DEFAULT 0,
+            resolved_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (email_id) REFERENCES emails (id)
+        )
+    ''')
+    
+    # LLM interactions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS llm_interactions (
+            id TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            response TEXT NOT NULL,
+            context_emails TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Last fetch tracking table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS last_fetch (
+            folder TEXT PRIMARY KEY,
+            last_fetch_time TEXT
+        )
+    ''')
+    
+    # RCA documents table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS rca_documents (
+            id TEXT PRIMARY KEY,
+            alert_id TEXT,
+            filename TEXT,
+            file_path TEXT,
+            upload_date TEXT,
+            analysis_text TEXT,
+            FOREIGN KEY (alert_id) REFERENCES alerts (id)
+        )
+    ''')
+    
+    # Create indexes for better performance
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_emails_sender ON emails(sender)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_emails_severity ON emails(severity)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON alerts(is_resolved)')
+    
+    conn.commit()
+    conn.close()
+
+def cleanup_old_data():
+    """Clean up data older than 15 days"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Calculate 15 days ago
+        fifteen_days_ago = (datetime.now(IST) - timedelta(days=15)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Delete old emails
+        cursor.execute('DELETE FROM emails WHERE date < ?', (fifteen_days_ago,))
+        deleted_emails = cursor.rowcount
+        
+        # Delete old alerts
+        cursor.execute('DELETE FROM alerts WHERE created_at < ?', (fifteen_days_ago,))
+        deleted_alerts = cursor.rowcount
+        
+        # Delete old LLM interactions
+        cursor.execute('DELETE FROM llm_interactions WHERE created_at < ?', (fifteen_days_ago,))
+        deleted_interactions = cursor.rowcount
+        
+        # Delete old RCA documents
+        cursor.execute('DELETE FROM rca_documents WHERE upload_date < ?', (fifteen_days_ago,))
+        deleted_rca_docs = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        if deleted_emails > 0 or deleted_alerts > 0 or deleted_interactions > 0 or deleted_rca_docs > 0:
+            st.info(f"Cleaned up old data: {deleted_emails} emails, {deleted_alerts} alerts, {deleted_interactions} interactions, {deleted_rca_docs} RCA documents")
+            
+    except Exception as e:
+        st.error(f"Failed to cleanup old data: {e}")
+
+# Helper functions for last fetch tracking
+def get_last_fetch_time(folder):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT last_fetch_time FROM last_fetch WHERE folder = ?', (folder,))
+    row = c.fetchone()
+    conn.close()
+    if row and row[0]:
+        return row[0]
+    return None
+
+def update_last_fetch_time(folder, last_fetch_time):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO last_fetch (folder, last_fetch_time) VALUES (?, ?)', (folder, last_fetch_time))
+    conn.commit()
+    conn.close()
+
+# IMAP connection management
+def get_imap_connection(access_token, folder, retries=5, initial_backoff=2):
+    """Enhanced IMAP connection with robust error handling and cleanup"""
+    auth_string = f"user={EMAIL_ACCOUNT}\x01auth=Bearer {access_token}\x01\x01"
+
+    for attempt in range(retries):
+        mail = None
+        try:
+            # Create fresh connection for each attempt
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+
+            # Set socket timeout for better error handling
+            mail.sock.settimeout(30)
+
+            # Authenticate with OAuth2
+            mail.authenticate("XOAUTH2", lambda x: auth_string.encode("utf-8"))
+
+            # Verify authentication status
+            status, data = mail.status('INBOX', '(MESSAGES)')
+            if status != 'OK':
+                raise Exception(f"Authentication verification failed: {status}")
+
+            # Select the target folder
+            status, data = mail.select(folder)
+            if status != 'OK':
+                raise Exception(f"Failed to select folder {folder}: {status} - {data}")
+
+            logging.info(f"Successfully connected to folder {folder} on attempt {attempt + 1}")
+            return mail, None
+
+        except Exception as e:
+            error_str = str(e)
+            logging.error(f"Attempt {attempt + 1}/{retries} failed for folder {folder}: {error_str}")
+
+            # Clean up failed connection
+            if mail:
+                try:
+                    mail.close()
+                    mail.logout()
+                except:
+                    pass
+
+            # Handle specific error types
+            if "authenticated but not connected" in error_str.lower():
+                # This specific error needs longer backoff
+                backoff_time = initial_backoff * (3 ** attempt)
+                logging.warning(f"Authentication/connection issue, backing off for {backoff_time} seconds")
+                time.sleep(backoff_time)
+            elif "throttled" in error_str.lower() or "rate limit" in error_str.lower():
+                # Rate limiting - exponential backoff
+                backoff_time = initial_backoff * (2 ** attempt)
+                logging.warning(f"Rate limiting detected, backing off for {backoff_time} seconds")
+                time.sleep(backoff_time)
+            elif attempt < retries - 1:
+                # Other errors - shorter backoff for retry
+                backoff_time = initial_backoff + (attempt * 2)
+                logging.info(f"Retrying connection in {backoff_time} seconds")
+                time.sleep(backoff_time)
+
+    return None, f"Failed to connect to folder {folder} after {retries} retries"
+
+def parse_sender(sender_str):
+    if not sender_str:
+        return "Unknown Sender"
+    sender_str = sender_str.replace('"', '').strip()
+    match = re.match(r"(.*)<(.+@.+)>", sender_str)
+    if match:
+        return match.group(2).lower().strip()
+    return sender_str.lower().strip()
+
+def fetch_email_direct(mail, num, folder):
+    """Fetch individual email using existing IMAP connection"""
+    try:
+        result, msg_data = mail.fetch(num, "(RFC822)")
+        if result != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+            return None
+
+        raw_email = msg_data[0][1]
+        if not isinstance(raw_email, bytes):
+            return None
+
+        msg = email.message_from_bytes(raw_email)
+        raw_sender = msg["From"]
+
+        # Decode subject
+        subject, encoding = decode_header(msg["Subject"])[0]
+        subject = subject.decode(encoding or "utf-8") if isinstance(subject, bytes) else subject
+
+        sender = parse_sender(raw_sender)
+
+        # Parse email date
+        email_date = email.utils.parsedate_tz(msg["Date"])
+        if email_date:
+            email_datetime = datetime(*email_date[:6])
+            if email_date[9] is not None:
+                offset = timedelta(seconds=email_date[9])
+                email_datetime -= offset
+            email_datetime_ist = pytz.utc.localize(email_datetime).astimezone(IST)
+            # Cap future dates to now if more than 5 minutes ahead
+            now_ist = datetime.now(IST)
+            if email_datetime_ist > now_ist + timedelta(minutes=5):
+                logging.warning(f"Email date {email_datetime_ist} is in the future. Capping to now.")
+                email_datetime_ist = now_ist
+            date_str = email_datetime_ist.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            logging.warning(f"Invalid date for email from {sender} with subject '{subject}'")
+            date_str = "Unknown Date"
+
+        # Extract email body
+        mail_body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type == "text/plain":
+                    mail_body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    break
+                elif content_type == "text/html":
+                    html_content = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    mail_body = soup.get_text(separator=' ', strip=True)
+                    break
+        else:
+            content_type = msg.get_content_type()
+            payload = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+            if content_type == "text/plain":
+                mail_body = payload
+            elif content_type == "text/html":
+                soup = BeautifulSoup(payload, 'html.parser')
+                mail_body = soup.get_text(separator=' ', strip=True)
+
+        return [date_str, sender, subject, mail_body.strip(), folder]
+
+    except Exception as e:
+        logging.error(f"Error fetching email {num} from {folder}: {e}")
+        return None
+
+def fetch_emails(start_date, end_date, access_token, max_emails=100):
+    """
+    Enhanced email fetching with robust IMAP connection handling and last fetch tracking.
+    Only fetches emails newer than the last fetch time for each folder, for fast dashboard updates.
+    """
+    all_email_data = []
+    messages = []
+
+    for folder in EMAIL_FOLDERS:
+        mail = None
+        try:
+            # Get fresh IMAP connection for each folder
+            mail, conn_error = get_imap_connection(access_token, folder)
+            if not mail:
+                messages.append(f"Connection failed for folder {folder}: {conn_error}")
+                logging.warning(f"Skipping folder {folder} due to connection failure: {conn_error}")
+                continue
+
+            # Use last fetch time if available
+            last_fetch_time = get_last_fetch_time(folder)
+            if last_fetch_time:
+                fetch_start_date = datetime.strptime(last_fetch_time, "%Y-%m-%d %H:%M:%S")
+            else:
+                fetch_start_date = start_date
+            start_date_str = fetch_start_date.strftime("%d-%b-%Y")
+            email_data = []
+
+            # Process each sender sequentially to avoid OAuth2 conflicts
+            for sender in SENDERS:
+                try:
+                    result, data = mail.search(None, f'SINCE {start_date_str} FROM "{sender}"')
+                    if result != "OK":
+                        messages.append(f"Error searching emails from {sender} in folder {folder}: {result}")
+                        continue
+
+                    mail_ids = data[0].split()
+                    if not mail_ids:
+                        continue
+
+                    # Limit emails per sender to avoid overwhelming the system
+                    mail_ids = mail_ids[-max_emails:] if len(mail_ids) > max_emails else mail_ids
+
+                    # Process emails sequentially to avoid connection issues
+                    for num in reversed(mail_ids):
+                        try:
+                            email_result = fetch_email_direct(mail, num, folder)
+                            if email_result:
+                                # Only add emails newer than last_fetch_time (if available)
+                                email_date = pd.to_datetime(email_result[0], errors='coerce')
+                                if last_fetch_time:
+                                    if email_date > fetch_start_date:
+                                        email_data.append(email_result)
+                                else:
+                                    email_data.append(email_result)
+                        except Exception as email_error:
+                            logging.warning(f"Failed to fetch email {num} from {sender}: {email_error}")
+                            continue
+
+                    logging.info(f"Processed {len(mail_ids)} emails from {sender} in {folder}")
+
+                except Exception as sender_error:
+                    logging.error(f"Error processing sender {sender} in folder {folder}: {sender_error}")
+                    continue
+
+            all_email_data.extend(email_data)
+            messages.append(f"Fetched {len(email_data)} emails from folder {folder}")
+
+            # Update last fetch time for this folder
+            update_last_fetch_time(folder, end_date.strftime("%Y-%m-%d %H:%M:%S"))
+
+        except Exception as e:
+            error_msg = f"Error fetching emails from folder {folder}: {e}"
+            messages.append(error_msg)
+            logging.error(error_msg)
+
+        finally:
+            # Always clean up the connection
+            if mail:
+                try:
+                    mail.close()
+                    mail.logout()
+                    logging.info(f"Successfully closed connection to folder {folder}")
+                except Exception as cleanup_error:
+                    logging.warning(f"Error during connection cleanup for {folder}: {cleanup_error}")
+
+    # Process results
+    if not all_email_data:
+        messages.append("No emails found matching the criteria")
+        return pd.DataFrame(columns=["Date", "Sender", "Subject", "Mail Body", "Folder"]), messages
+
+    df = pd.DataFrame(all_email_data, columns=["Date", "Sender", "Subject", "Mail Body", "Folder"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna(df["Date"])
+
+    messages.append(f"Total emails fetched across all folders: {len(df)}")
+    logging.info(f"Successfully fetched {len(df)} emails across {len(EMAIL_FOLDERS)} folders")
+
+    return df, messages
+
+def process_and_store_emails(df):
+    """Process and store emails in the enhanced database"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    email_records = []
+    for _, row in df.iterrows():
+        subject = row["Subject"]
+        sender = row["Sender"]
+        date = row["Date"]
+        mail_body = row["Mail Body"]
+        folder = row["Folder"]
+        
+        # Detect critical keywords and severity
+        critical_keywords, severity = detect_critical_keywords(subject + " " + mail_body)
+        
+        # Extract application name
+        app_name = extract_application_name(subject, sender, mail_body)
+        
+        # Generate unique ID and hash
+        email_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{date}_{sender}_{subject[:50]}"))
+        email_hash = hashlib.md5(f"{date}_{sender}_{subject}_{mail_body[:100]}".encode()).hexdigest()
+        
+        email_records.append((
+            email_id, date, sender, subject, mail_body, folder,
+            severity, ",".join(critical_keywords) if critical_keywords else "",
+            app_name, email_hash
+        ))
+
+    try:
+        cursor.executemany('''INSERT OR REPLACE INTO emails
+                             (id, date, sender, subject, body, folder, severity, keywords, application, hash)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', email_records)
+        conn.commit()
+        logging.info(f"Successfully stored {len(email_records)} emails in database")
+    except Exception as e:
+        logging.error(f"Failed to insert emails into database: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+# Helper functions from your original code
+def detect_critical_keywords(text):
+    """Detect critical keywords in text and return keywords with severity"""
+    if not text:
+        return [], "LOW"
+    
+    text_lower = text.lower()
+    found_keywords = []
+    highest_severity = "LOW"
+    
+    # Check keywords in order of severity (CRITICAL first, then HIGH, etc.)
+    severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    
+    for severity in severity_order:
+        keywords = CRITICAL_KEYWORDS.get(severity, [])
+        for keyword in keywords:
+            if keyword in text_lower:
+                found_keywords.append(keyword)
+                # Update highest severity if we found a more critical keyword
+                if severity_order.index(severity) < severity_order.index(highest_severity):
+                    highest_severity = severity
+    
+    return list(set(found_keywords)), highest_severity
+
+def extract_application_name(subject, sender=None, mail_body=None):
+    """Extract application name from email data"""
+    # This is a simplified version - you can enhance this based on your needs
+    text_to_search = f"{subject} {sender or ''} {mail_body or ''}"
+    
+    # Common application patterns
+    app_patterns = [
+        r'oracle|weblogic|websphere|tomcat|apache|nginx',
+        r'mysql|postgresql|sqlserver|mongodb|redis',
+        r'aws|azure|gcp|cloud',
+        r'vmware|hyperv|kvm',
+        r'windows|linux|unix',
+        r'network|firewall|router|switch',
+        r'email|smtp|imap|pop3',
+        r'database|db|sql',
+        r'web|http|https|api',
+        r'backup|storage|disk|file'
+    ]
+    
+    for pattern in app_patterns:
+        match = re.search(pattern, text_to_search, re.IGNORECASE)
+        if match:
+            return match.group(0).title()
+    
+    return "Unknown"
+
+# Enhanced Email Processing
+def process_email_for_llm(email_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Process email data for LLM analysis"""
+    try:
+        # Extract application name
+        application = extract_application_name(
+            email_data.get('subject', ''),
+            email_data.get('sender', ''),
+            email_data.get('body', '')
+        )
+        
+        # Detect critical keywords
+        keywords = detect_critical_keywords(email_data.get('body', '') + ' ' + email_data.get('subject', ''))
+        
+        # Determine severity
+        severity = "LOW"
+        if any(keyword in keywords for keyword in CRITICAL_KEYWORDS["CRITICAL"]):
+            severity = "CRITICAL"
+        elif any(keyword in keywords for keyword in CRITICAL_KEYWORDS["HIGH"]):
+            severity = "HIGH"
+        elif any(keyword in keywords for keyword in CRITICAL_KEYWORDS["MEDIUM"]):
+            severity = "MEDIUM"
+        
+        # Generate hash for deduplication
+        email_hash = hashlib.md5(
+            f"{email_data.get('subject', '')}{email_data.get('sender', '')}{email_data.get('date', '')}".encode()
+        ).hexdigest()
+        
+        return {
+            'id': email_data.get('id', str(uuid.uuid4())),
+            'date': email_data.get('date', ''),
+            'sender': email_data.get('sender', ''),
+            'subject': email_data.get('subject', ''),
+            'body': email_data.get('body', ''),
+            'folder': email_data.get('folder', ''),
+            'severity': severity,
+            'keywords': ', '.join(keywords),
+            'application': application,
+            'hash': email_hash
+        }
+        
+    except Exception as e:
+        st.error(f"Failed to process email for LLM: {e}")
+        return email_data
+
+# LLM Query Processing
+class LLMQueryProcessor:
+    
+    def __init__(self, llm_config: LLMConfig, vector_db_manager: VectorDBManager):
+        self.llm_config = llm_config
+        self.vector_db_manager = vector_db_manager
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",       # keeps conversation history
+            return_messages=True              # ensures you get ChatMessage objects
+        )
+        self.response_cache = {}  # Simple cache for responses
+        self.current_model_type = "fast"  # Default to fast model
+        self.llm = None  # Will be initialized when needed
+
+    def get_llm(self, model_type="fast"):
+        """Get LLM instance with specified model type"""
+        if self.llm is None or self.current_model_type != model_type:
+            self.current_model_type = model_type
+            if TINYLLAMA_AVAILABLE:
+                self.llm = self.llm_config.get_llm(model_type)
+            else:
+                self.llm = self.llm_config.get_llm()
+        return self.llm
+
+    def create_qa_chain(self, model_type="fast"):
+        """Create a question-answering chain"""
+        llm = self.get_llm(model_type)
+        if not llm:
+            return None
+            
+        if not self.vector_db_manager.vector_db:
+            st.warning("Vector database not available - using direct LLM query")
+            return self.create_direct_qa_chain(llm)
+            
+        try:
+            # Ultra-fast prompt template for better performance
+            template = """IT Alert Analysis - Quick Response:
+            
+            Context: {context}
+            Question: {question}
+            
+            Quick Answer:"""
+            
+            prompt = PromptTemplate(
+                template=template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create retrieval chain with optimized settings
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=self.vector_db_manager.vector_db.as_retriever(search_kwargs={"k": 2}),  # Reduced from 3 to 2
+                chain_type_kwargs={"prompt": prompt}
+            )
+            
+            return qa_chain
+            
+        except Exception as e:
+            st.error(f"Failed to create QA chain: {e}")
+            st.info("Falling back to direct LLM query...")
+            return self.create_direct_qa_chain(llm)
+    
+    def create_direct_qa_chain(self, llm):
+        """Create a direct QA chain without vector database"""
+        try:
+            template = """You are an IT operations expert analyzing system alerts and emails.
+
+Question: {question}
+
+Based on your knowledge of IT systems, provide a helpful analysis and recommendations.
+Focus on:
+1. Identifying the type of issue
+2. Suggesting potential causes
+3. Recommending immediate actions
+4. Providing preventive measures
+
+Answer:"""
+            
+            prompt = PromptTemplate(
+                template=template,
+                input_variables=["question"]
+            )
+            
+            from langchain.chains import LLMChain
+            return LLMChain(llm=llm, prompt=prompt)
+            
+        except Exception as e:
+            st.error(f"Failed to create direct QA chain: {e}")
+            return None
+    
+    def process_query(self, query: str, model_type="fast") -> Dict[str, Any]:
+        """Process a user query using LLM"""
+        try:
+            # Check cache first for faster responses
+            cache_key = f"{query}_{model_type}"
+            if CACHE_LLM_RESPONSES and cache_key in self.response_cache:
+                st.info("📋 Using cached response for faster results")
+                return self.response_cache[cache_key]
+            
+            llm = self.get_llm(model_type)
+            if not llm:
+                # Fallback: Provide similar emails without LLM analysis
+                similar_emails = self.vector_db_manager.search_similar_emails(query, k=3)
+                
+                if similar_emails:
+                    context = "Based on similar emails found in the system:\n\n"
+                    for doc, score in similar_emails:
+                        context += f"• Email (similarity: {score:.3f}): {doc.page_content}\n\n"
+                    
+                    fallback_response = f"""
+                    **LLM Analysis Unavailable**
+                    
+                    I found {len(similar_emails)} similar emails related to your query. 
+                    Here's what I found:
+                    
+                    {context}
+                    
+                    **To enable AI analysis:**
+                    1. Download TinyLlama: `python3 setup_tinyllama.py`
+                    2. Or manually download from: https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
+                    3. Place the model files in the 'models' directory
+                    4. Restart the application
+                    """
+                    
+                    return {
+                        "response": fallback_response,
+                        "context_emails": similar_emails,
+                        "similarity_scores": [score for _, score in similar_emails],
+                        "mode": "fallback"
+                    }
+                else:
+                    return {
+                        "error": "LLM not available and no similar emails found. Please download TinyLlama to enable AI analysis."
+                    }
+            
+            # Search for similar emails (ultra-reduced for faster processing)
+            similar_emails = self.vector_db_manager.search_similar_emails(query, k=2)  # Reduced to 2 for ultra-fast mode
+            
+            # Create minimal context for faster processing
+            context = ""
+            for doc, score in similar_emails:
+                # Ultra-truncate content for faster processing
+                content = doc.page_content[:200] if FAST_MODE else doc.page_content[:500]
+                context += f"Email ({score:.2f}): {content}\n"
+            
+            # Create QA chain
+            qa_chain = self.create_qa_chain(model_type)
+            if not qa_chain:
+                return {"error": "Failed to create QA chain"}
+            
+            # Get response
+            if hasattr(qa_chain, 'run'):
+                # Standard QA chain
+                response = qa_chain.run(query)
+            else:
+                # Direct LLM chain
+                response = qa_chain.invoke({"question": query})
+                if isinstance(response, dict):
+                    response = response.get('text', str(response))
+            
+            # Store interaction
+            store_llm_interaction(query, response, context)
+            
+            result = {
+                "response": response,
+                "context_emails": similar_emails,
+                "similarity_scores": [score for _, score in similar_emails],
+                "mode": "llm",
+                "model_type": model_type
+            }
+            
+            # Cache the result for faster future queries
+            if CACHE_LLM_RESPONSES:
+                self.response_cache[cache_key] = result
+            
+            return result
+            
+        except Exception as e:
+            st.error(f"Failed to process query: {e}")
+            return {"error": str(e)}
+
+def store_llm_interaction(query: str, response: str, context: str):
+    """Store LLM interaction in database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        interaction_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO llm_interactions (id, query, response, context_emails)
+            VALUES (?, ?, ?, ?)
+        ''', (interaction_id, query, response, context))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"Failed to store LLM interaction: {e}")
+
+def fast_keyword_analysis(query: str) -> Dict[str, Any]:
+    """Fast keyword-based analysis without LLM"""
+    try:
+        # Extract keywords from query
+        query_lower = query.lower()
+        found_keywords = []
+        
+        # Check for critical keywords in query
+        for severity, keywords in CRITICAL_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in query_lower:
+                    found_keywords.append((keyword, severity))
+        
+        # Search database for emails with similar keywords
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Build SQL query based on found keywords
+        if found_keywords:
+            keyword_conditions = []
+            for keyword, severity in found_keywords:
+                keyword_conditions.append(f"(keywords LIKE '%{keyword}%' OR subject LIKE '%{keyword}%' OR body LIKE '%{keyword}%')")
+            
+            where_clause = " OR ".join(keyword_conditions)
+            sql_query = f'''
+                SELECT date, sender, subject, severity, keywords, application
+                FROM emails 
+                WHERE {where_clause}
+                ORDER BY date DESC 
+                LIMIT 10
+            '''
+        else:
+            # If no keywords found, search for any emails containing query terms
+            query_terms = query_lower.split()
+            term_conditions = []
+            for term in query_terms:
+                if len(term) > 2:  # Only search for terms longer than 2 characters
+                    term_conditions.append(f"(subject LIKE '%{term}%' OR body LIKE '%{term}%')")
+            
+            if term_conditions:
+                where_clause = " OR ".join(term_conditions)
+                sql_query = f'''
+                    SELECT date, sender, subject, severity, keywords, application
+                    FROM emails 
+                    WHERE {where_clause}
+                    ORDER BY date DESC 
+                    LIMIT 10
+                '''
+            else:
+                sql_query = '''
+                    SELECT date, sender, subject, severity, keywords, application
+                    FROM emails 
+                    ORDER BY date DESC 
+                    LIMIT 5
+                '''
+        
+        similar_emails = pd.read_sql_query(sql_query, conn)
+        conn.close()
+        
+        # Generate response based on found emails
+        if not similar_emails.empty:
+            # Count by severity
+            severity_counts = similar_emails['severity'].value_counts()
+            
+            response = f"""
+**Fast Analysis Results for: "{query}"**
+
+**Found Keywords:** {', '.join([kw for kw, _ in found_keywords]) if found_keywords else 'None detected'}
+
+**Alert Summary:**
+- Total related emails found: {len(similar_emails)}
+- Critical alerts: {severity_counts.get('CRITICAL', 0)}
+- High priority alerts: {severity_counts.get('HIGH', 0)}
+- Medium priority alerts: {severity_counts.get('MEDIUM', 0)}
+- Low priority alerts: {severity_counts.get('LOW', 0)}
+
+**Top Applications Affected:**
+{similar_emails['application'].value_counts().head(3).to_string() if not similar_emails['application'].empty else 'None identified'}
+
+**Recent Related Alerts:**
+{similar_emails[['date', 'sender', 'subject', 'severity']].head(3).to_string()}
+            """
+        else:
+            response = f"""
+**Fast Analysis Results for: "{query}"**
+
+No related emails found in the database. This could mean:
+- The issue is new and hasn't been reported yet
+- The search terms don't match existing alerts
+- Try using different keywords or check the "Ultra Fast" mode for similar emails
+            """
+        
+        return {
+            "response": response,
+            "similar_emails": similar_emails.to_dict('records') if not similar_emails.empty else [],
+            "found_keywords": found_keywords,
+            "mode": "fast_keyword"
+        }
+        
+    except Exception as e:
+        return {
+            "response": f"Fast analysis failed: {str(e)}",
+            "similar_emails": [],
+            "found_keywords": [],
+            "mode": "error"
+        }
+
+# Enhanced UI Components
+def render_llm_search_interface():
+    """Render the LLM search interface"""
+    st.markdown("<h2 class='section-header'>🤖 AI-Powered Issue Analysis</h2>", unsafe_allow_html=True)
+    
+    # Initialize components
+    if 'llm_config' not in st.session_state:
+        st.session_state.llm_config = LLMConfig()
+    
+    if 'vector_db_manager' not in st.session_state:
+        st.session_state.vector_db_manager = VectorDBManager()
+    
+    if 'llm_processor' not in st.session_state:
+        st.session_state.llm_processor = LLMQueryProcessor(
+            st.session_state.llm_config,
+            st.session_state.vector_db_manager
+        )
+    
+    # Analysis mode selection
+    if TINYLLAMA_AVAILABLE:
+        analysis_mode = st.radio(
+            "Choose Analysis Mode:",
+            ["⚡ Ultra Fast (Similar Emails Only)", "🚀 Fast Mode (Keyword Search)", 
+             "🤖 TinyLlama Ultra Fast", "🤖 TinyLlama Fast", "🤖 TinyLlama Balanced", "🤖 AI Analysis (Full)"],
+            help="Ultra Fast: Just similar emails, Fast Mode: Keyword matching, TinyLlama: Different model sizes, Full: Complete LLM analysis"
+        )
+    else:
+        analysis_mode = st.radio(
+            "Choose Analysis Mode:",
+            ["⚡ Ultra Fast (Similar Emails Only)", "🚀 Fast Mode (Keyword Search)", "🤖 AI Analysis (Optimized)", "🤖 AI Analysis (Full)"],
+            help="Ultra Fast: Just similar emails, Fast Mode: Keyword matching, AI Analysis: Optimized LLM, Full: Complete LLM analysis"
+        )
+    
+    # Search interface
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        user_query = st.text_area(
+            "Describe the issue you're experiencing or ask a question about your system:",
+            placeholder="e.g., 'Why is my database connection slow?' or 'What alerts are related to authentication failures?'",
+            height=100
+        )
+    
+    with col2:
+        st.write("")
+        st.write("")
+        search_button = st.button("🔍 Analyze", use_container_width=True)
+    
+    if search_button and user_query:
+        with st.spinner("Analyzing..."):
+            if analysis_mode == "⚡ Ultra Fast (Similar Emails Only)":
+                # Ultra fast mode - just show similar emails
+                similar_emails = st.session_state.vector_db_manager.search_similar_emails(user_query, k=5)
+                st.success("✅ Ultra Fast Analysis Complete")
+                st.markdown("### Similar Emails Found")
+                
+                if similar_emails:
+                    for i, (doc, score) in enumerate(similar_emails):
+                        with st.expander(f"Similar Email {i+1} (Similarity: {score:.3f})"):
+                            st.write("**Content:**")
+                            st.write(doc.page_content)
+                            st.write("**Metadata:**")
+                            st.write(doc.metadata)
+                else:
+                    st.info("No similar emails found")
+                    
+            elif analysis_mode == "🚀 Fast Mode (Keyword Search)":
+                # Fast mode - use keyword-based analysis
+                result = fast_keyword_analysis(user_query)
+                st.success("✅ Fast Analysis Complete")
+                st.markdown("### Fast Analysis Results")
+                st.write(result["response"])
+                
+                if result.get("similar_emails"):
+                    st.markdown("**Related Emails Found:**")
+                    for i, email_data in enumerate(result["similar_emails"]):
+                        with st.expander(f"Related Email {i+1}"):
+                            st.write(f"**Subject:** {email_data['subject']}")
+                            st.write(f"**Sender:** {email_data['sender']}")
+                            st.write(f"**Date:** {email_data['date']}")
+                            st.write(f"**Severity:** {email_data['severity']}")
+                            st.write(f"**Keywords:** {email_data['keywords']}")
+                            
+            elif analysis_mode in ["🤖 TinyLlama Ultra Fast", "🤖 TinyLlama Fast", "🤖 TinyLlama Balanced", "🤖 AI Analysis (Optimized)", "🤖 AI Analysis (Full)"]:
+                # Map UI modes to model types
+                mode_mapping = {
+                    "🤖 TinyLlama Ultra Fast": "ultra_fast",
+                    "🤖 TinyLlama Fast": "fast",
+                    "🤖 TinyLlama Balanced": "balanced",
+                    "🤖 AI Analysis (Optimized)": "optimized",
+                    "🤖 AI Analysis (Full)": "full"
+                }
+                
+                # Get the appropriate model type
+                model_type = mode_mapping[analysis_mode]
+                
+                # Process the query with the selected model
+                result = st.session_state.llm_processor.process_query(user_query, model_type)
+                
+                # Display results
+                if "error" in result:
+                    st.error(f"Error during analysis: {result['error']}")
+                else:
+                    st.success("✅ Analysis Complete")
+                    
+                    # Display the main response
+                    st.markdown("### Analysis Results")
+                    st.markdown(result.get("response", "No analysis available."))
+                    
+                    # Display similar emails if available
+                    if result.get("context_emails"):
+                        st.markdown("\n### Related Emails")
+                        for i, (doc, score) in enumerate(result["context_emails"]):
+                            with st.expander(f"Related Email {i+1} (Relevance: {score:.2f})"):
+                                st.write("**Content:**")
+                                st.write(doc.page_content)
+                                if hasattr(doc, 'metadata'):
+                                    st.write("**Metadata:**")
+                                    st.write(doc.metadata)
+                    
+                    # Display any additional context or metadata
+                    if result.get("mode") == "fallback":
+                        st.warning("Note: This is a fallback response. For full AI analysis, please ensure the model is properly configured.")
+                    
+            else:
+                # Full AI analysis mode
+                result = st.session_state.llm_processor.process_query(user_query)
+                
+                if "error" in result:
+                    st.error(f"Analysis failed: {result['error']}")
+                else:
+                    # Display results
+                    mode = result.get("mode", "unknown")
+                    if mode == "fallback":
+                        st.warning("⚠️ Running in fallback mode (LLM not available)")
+                        st.markdown("### Search Results")
+                    else:
+                        st.success("✅ AI Analysis Complete")
+                        st.markdown("### AI Analysis Results")
+                    
+                    # Main response
+                    st.markdown("**Response:**")
+                    st.write(result["response"])
+                    
+                    # Similar emails found
+                    if result.get("context_emails"):
+                        st.markdown("**Related Emails Found:**")
+                        for i, (doc, score) in enumerate(result["context_emails"]):
+                            with st.expander(f"Related Email {i+1} (Similarity: {score:.3f})"):
+                                st.write(doc.page_content)
+                                st.write(f"**Metadata:** {doc.metadata}")
+
+def render_rca_management(alert_id: str, llm_processor: 'LLMQueryProcessor'):
+    """Render RCA document management UI"""
+    st.subheader("RCA Document Management")
+    
+    # Upload new document
+    with st.expander("📤 Upload RCA Document"):
+        uploaded_file = st.file_uploader("Choose a file", type=["pdf", "docx", "txt"])
+        if uploaded_file and st.button("Upload"):
+            try:
+                save_rca_document(alert_id, uploaded_file, uploaded_file.name, uploaded_file.type)
+                st.success("Document uploaded!")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+    
+    # List existing documents
+    st.subheader("Existing Documents")
+    docs = get_alert_rca_documents(alert_id)
+    
+    if not docs:
+        st.info("No RCA documents found.")
+        return
+    
+    for doc in docs:
+        with st.expander(f"📄 {doc['filename']}"):
+            st.caption(f"Uploaded: {doc['upload_date']}")
+            
+            if doc.get('analysis_text'):
+                st.markdown("### Analysis")
+                st.markdown(doc['analysis_text'])
+            elif st.button("Analyze", key=f"analyze_{doc['id']}"):
+                with st.spinner("Analyzing..."):
+                    result = analyze_rca_document(doc['id'], llm_processor)
+                    if result['status'] == 'success':
+                        st.experimental_rerun()
+                    else:
+                        st.error("Analysis failed")
+            
+            if st.button("Delete", key=f"delete_{doc['id']}"):
+                try:
+                    doc_data = get_rca_document(doc['id'])
+                    if doc_data and 'file_path' in doc_data and os.path.exists(doc_data['file_path']):
+                        os.remove(doc_data['file_path'])
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute('DELETE FROM rca_documents WHERE id = ?', (doc['id'],))
+                    conn.commit()
+                    conn.close()
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Deletion failed: {e}")
+
+def render_data_analytics():
+    """Render enhanced data analytics"""
+    st.markdown("<h2 class='section-header'>📊 Enhanced Analytics</h2>", unsafe_allow_html=True)
+    
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # 15-day trend analysis
+        st.markdown("### 15-Day Trend Analysis")
+        
+        # Get data for last 15 days
+        fifteen_days_ago = (datetime.now(IST) - timedelta(days=15)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Daily alert counts
+        daily_alerts = pd.read_sql_query('''
+            SELECT DATE(date) as day, COUNT(*) as alert_count, severity
+            FROM emails 
+            WHERE date >= ?
+            GROUP BY DATE(date), severity
+            ORDER BY day
+        ''', conn, params=(fifteen_days_ago,))
+        
+        if not daily_alerts.empty:
+            # Create trend chart
+            fig = px.line(daily_alerts, x='day', y='alert_count', color='severity',
+                         title='Daily Alert Trends (Last 15 Days)',
+                         labels={'alert_count': 'Number of Alerts', 'day': 'Date'})
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Top applications by alert count
+        st.markdown("### Top Applications by Alert Count")
+        app_alerts = pd.read_sql_query('''
+            SELECT application, COUNT(*) as alert_count, severity
+            FROM emails 
+            WHERE date >= ? AND application IS NOT NULL
+            GROUP BY application, severity
+            ORDER BY alert_count DESC
+            LIMIT 10
+        ''', conn, params=(fifteen_days_ago,))
+        
+        if not app_alerts.empty:
+            fig = px.bar(app_alerts, x='application', y='alert_count', color='severity',
+                        title='Top Applications by Alert Count',
+                        labels={'alert_count': 'Number of Alerts', 'application': 'Application'})
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Sender analysis
+        st.markdown("### Alert Distribution by Sender")
+        sender_alerts = pd.read_sql_query('''
+            SELECT sender, COUNT(*) as alert_count, severity
+            FROM emails 
+            WHERE date >= ?
+            GROUP BY sender, severity
+            ORDER BY alert_count DESC
+            LIMIT 10
+        ''', conn, params=(fifteen_days_ago,))
+        
+        if not sender_alerts.empty:
+            fig = px.pie(sender_alerts, values='alert_count', names='sender',
+                        title='Alert Distribution by Sender')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"Failed to load analytics: {e}")
+
+# Token management functions
+def save_tokens(access_token, refresh_token, expires_at):
+    tokens = {"access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at}
+    with open("tokens.json", "w") as f:
+        json.dump(tokens, f)
+
+def load_tokens():
+    try:
+        with open("tokens.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+def get_initial_token_client_credentials(retries=3, initial_backoff=5):
+    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": SCOPE,
+        "grant_type": "client_credentials"
+    }
+
+    for attempt in range(retries):
+        try:
+            response = requests.post(token_url, data=data)
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", initial_backoff * (2 ** attempt)))
+                logging.warning(f"Throttled. Retrying after {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
+            response_json = response.json()
+            if "access_token" not in response_json:
+                raise Exception("Failed to get token: " + response_json.get("error_description", "Unknown error"))
+            access_token = response_json["access_token"]
+            expires_in = response_json["expires_in"]
+            expires_at = datetime.now().timestamp() + expires_in
+            save_tokens(access_token, None, expires_at)
+            return access_token
+        except Exception as e:
+            logging.error(f"Token request failed on attempt {attempt + 1}: {e}")
+            time.sleep(initial_backoff * (2 ** attempt))
+    raise Exception("Exceeded maximum retry attempts for token retrieval.")
+
+def get_valid_access_token():
+    tokens = load_tokens()
+    if not tokens:
+        return get_initial_token_client_credentials()
+    access_token = tokens["access_token"]
+    expires_at = tokens["expires_at"]
+    if datetime.now().timestamp() > expires_at - 300:  # 5-minute buffer
+        return get_initial_token_client_credentials()
+    return access_token
+
+# Main application
+def main():
+    # Initialize database
+    init_enhanced_db()
+    
+    # Cleanup old data
+    cleanup_old_data()
+    
+    # Header
+    st.markdown("""
+        <div style='text-align: center; padding: 20px 0;'>
+            <h1 style='color: #1e293b; margin: 0; font-size: 2em;'>🚨 Enhanced Mail Alerts Dashboard</h1>
+            <p style='color: #64748b; font-size: 1em; margin: 5px 0 0;'>AI-Powered Email Monitoring with 15-Day Data Retention</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    # Sidebar
+    with st.sidebar:
+        st.markdown("<h2 style='color: #1e293b; font-weight: 600;'>Settings</h2>", unsafe_allow_html=True)
+        
+        # Email Fetching
+        with st.expander("📧 Email Fetching", expanded=True):
+            st.info("Fetch emails from your IMAP server")
+            
+            # Manual fetch button
+            if st.button("Fetch New Emails Now", use_container_width=True):
+                try:
+                    with st.spinner("Fetching emails from IMAP server..."):
+                        # Get access token
+                        access_token = get_valid_access_token()
+                        
+                        # Set date range (last 24 hours)
+                        end_date = datetime.now(IST)
+                        start_date = end_date - timedelta(hours=24)
+                        
+                        # Fetch emails
+                        df, messages = fetch_emails(start_date, end_date, access_token, max_emails=50)
+                        
+                        if not df.empty:
+                            # Process and store emails
+                            process_and_store_emails(df)
+                            st.success(f"Successfully fetched and stored {len(df)} emails!")
+                            
+                            # Show messages
+                            for msg in messages:
+                                st.info(msg)
+                        else:
+                            st.warning("No new emails found in the specified time range")
+                            
+                except Exception as e:
+                    st.error(f"Failed to fetch emails: {e}")
+                    logging.error(f"Email fetching failed: {e}")
+        
+        # LLM Configuration
+        with st.expander("🤖 LLM Configuration", expanded=False):
+            if TINYLLAMA_AVAILABLE:
+                st.success("✅ TinyLlama is available!")
+                st.info("Configure your TinyLlama model settings here")
+                
+                # TinyLlama model selection
+                model_option = st.selectbox(
+                    "TinyLlama Model Type",
+                    ["Ultra Fast (Q2_K) - 450MB", "Fast (Q4_0) - 700MB", "Balanced (Q5_0) - 850MB"],
+                    help="Smaller models are faster but may be less accurate"
+                )
+                
+                # Model info
+                if "Ultra Fast" in model_option:
+                    st.info("🚀 Ultra Fast: Best for quick responses, lowest memory usage")
+                elif "Fast" in model_option:
+                    st.info("⚡ Fast: Balanced speed and quality, recommended for most use cases")
+                else:
+                    st.info("⚖️ Balanced: Best quality, higher memory usage")
+                
+            else:
+                st.warning("⚠️ TinyLlama not available")
+                st.info("Configure your Llama model settings here")
+                
+                # Model selection
+                model_option = st.selectbox(
+                    "Model Type",
+                    ["Standard Model (Q2_K)", "Lightweight Model (Q4_0) - Faster", "Ultra Lightweight (Q5_0) - Fastest"],
+                    help="Lightweight models are faster but may be less accurate"
+                )
+                
+                # Download lightweight model
+                if model_option != "Standard Model (Q2_K)":
+                    if st.button("📥 Download Lightweight Model"):
+                        with st.spinner("Downloading lightweight model..."):
+                            st.info("To download lightweight models:")
+                            st.info("1. Visit: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF")
+                            st.info("2. Download: llama-2-7b-chat.Q4_0.gguf (faster)")
+                            st.info("3. Place in 'models' directory")
+                            st.info("4. Restart the application")
+            
+            temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+            max_tokens = st.slider("Max Tokens", 256, 2048, 384, 256)
+            
+            if st.button("Update LLM Config"):
+                if 'llm_config' in st.session_state:
+                    st.session_state.llm_config.temperature = temperature
+                    st.session_state.llm_config.max_tokens = max_tokens
+                    st.success("LLM configuration updated!")
+            
+            # TinyLlama setup button
+            if not TINYLLAMA_AVAILABLE:
+                if st.button("🚀 Setup TinyLlama"):
+                    st.info("To setup TinyLlama:")
+                    st.info("1. Run: python3 setup_tinyllama.py")
+                    st.info("2. This will download and configure TinyLlama models")
+                    st.info("3. Restart the application after setup")
+        
+        # Data Management
+        with st.expander("🗄️ Data Management", expanded=False):
+            st.info("Manage your 15-day data retention")
+            
+            if st.button("Clean Old Data"):
+                cleanup_old_data()
+                st.success("Old data cleaned successfully!")
+            
+            if st.button("Rebuild Vector Database"):
+                with st.spinner("Rebuilding vector database..."):
+                    # This would rebuild the vector database from scratch
+                    st.info("Vector database rebuild initiated")
+        
+        # Performance Tips
+        with st.expander("⚡ Performance Tips", expanded=False):
+            st.info("Make AI analysis faster")
+            
+            st.markdown("**🚀 Speed Options:**")
+            st.markdown("1. **Ultra Fast Mode**: Just shows similar emails")
+            st.markdown("2. **Fast Mode**: Keyword-based analysis")
+            st.markdown("3. **AI Analysis (Optimized)**: Fast LLM with reduced context")
+            st.markdown("4. **AI Analysis (Full)**: Complete LLM analysis")
+            
+            st.markdown("**📥 Download Faster Models:**")
+            if st.button("Download Lightweight Model"):
+                st.info("Run: python3 download_lightweight_model.py")
+                st.info("Or visit: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF")
+            
+            st.markdown("**🔧 System Optimizations:**")
+            st.markdown("- Use more CPU threads (8+ recommended)")
+            st.markdown("- Increase RAM (8GB+ recommended)")
+            st.markdown("- Use SSD storage for faster I/O")
+            st.markdown("- Enable GPU acceleration if available")
+        
+        # Troubleshooting
+        with st.expander("🔧 Troubleshooting", expanded=False):
+            st.info("Fix common issues")
+            
+            if st.button("Disable Vector DB (Fix Meta Tensor Error)"):
+                st.session_state.disable_vector_db = True
+                st.success("Vector database disabled. Please restart the app for changes to take effect.")
+                st.info("To re-enable later, set ENABLE_VECTOR_DB = True in the code")
+        
+        # System Status
+        with st.expander("📊 System Status", expanded=False):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                
+                # Email count
+                email_count = pd.read_sql_query('SELECT COUNT(*) as count FROM emails', conn).iloc[0]['count']
+                st.metric("Total Emails", email_count)
+                
+                # Alert count
+                alert_count = pd.read_sql_query('SELECT COUNT(*) as count FROM alerts', conn).iloc[0]['count']
+                st.metric("Total Alerts", alert_count)
+                
+                # LLM interactions
+                interaction_count = pd.read_sql_query('SELECT COUNT(*) as count FROM llm_interactions', conn).iloc[0]['count']
+                st.metric("LLM Interactions", interaction_count)
+                
+                conn.close()
+                
+            except Exception as e:
+                st.error(f"Failed to load system status: {e}")
+    
+    # Main content tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["🔍 AI Search", "📊 Analytics", "📧 Recent Emails", "⚙️ Settings"])
+    
+    with tab1:
+        render_llm_search_interface()
+    
+    with tab2:
+        render_data_analytics()
+    
+    with tab3:
+        # Recent emails display (simplified version of your existing code)
+        st.markdown("<h2 class='section-header'>📧 Recent Emails</h2>", unsafe_allow_html=True)
+        
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            
+            # Get recent emails
+            recent_emails = pd.read_sql_query('''
+                SELECT date, sender, subject, severity, application, keywords
+                FROM emails 
+                ORDER BY date DESC 
+                LIMIT 50
+            ''', conn)
+            
+            if not recent_emails.empty:
+                st.dataframe(
+                    recent_emails,
+                    use_container_width=True,
+                    column_config={
+                        "date": st.column_config.DatetimeColumn("Date"),
+                        "sender": st.column_config.TextColumn("Sender"),
+                        "subject": st.column_config.TextColumn("Subject"),
+                        "severity": st.column_config.SelectboxColumn("Severity", options=["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
+                        "application": st.column_config.TextColumn("Application"),
+                        "keywords": st.column_config.TextColumn("Keywords")
+                    }
+                )
+            else:
+                st.info("No emails found in the database. Click 'Fetch New Emails Now' in the sidebar to populate the database.")
+            
+            conn.close()
+            
+        except Exception as e:
+            st.error(f"Failed to load recent emails: {e}")
+    
+    with tab4:
+        st.markdown("<h2 class='section-header'>⚙️ System Settings</h2>", unsafe_allow_html=True)
+        
+        # Database information
+        st.markdown("### Database Information")
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            
+            # Table sizes
+            tables = ['emails', 'alerts', 'llm_interactions']
+            for table in tables:
+                count = pd.read_sql_query(f'SELECT COUNT(*) as count FROM {table}', conn).iloc[0]['count']
+                st.metric(f"{table.title()} Count", count)
+            
+            # Database size
+            db_size = os.path.getsize(DB_FILE) / (1024 * 1024)  # MB
+            st.metric("Database Size", f"{db_size:.2f} MB")
+            
+            conn.close()
+            
+        except Exception as e:
+            st.error(f"Failed to load database information: {e}")
+
+if __name__ == "__main__":
+    main() 

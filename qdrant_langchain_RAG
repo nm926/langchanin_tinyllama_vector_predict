@@ -105,10 +105,6 @@ st.set_page_config(page_title="Enhanced Mail Alerts Dashboard with LLM",
 
 # Azure AD app details (should be stored in environment variables for production)
 
-# IMAP Server Details
-IMAP_SERVER = "outlook.office365.com"
-IMAP_PORT = 993
-EMAIL_ACCOUNT = "im@aubank.in"
 
 # Set timezone to IST
 IST = pytz.timezone("Asia/Kolkata")
